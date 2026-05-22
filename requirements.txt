@@ -1,2 +1,4 @@
 requests>=2.33.0
 python-dotenv>=1.2.2
+beautifulsoup4>=4.12
+playwright>=1.44

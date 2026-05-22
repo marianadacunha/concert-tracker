@@ -2,8 +2,8 @@
 Concert Tracker
 ---------------
 1. Puxa top 150 artistas do Last.fm
-2. Busca shows em São Paulo via Setlist.fm
-3. Cruza artistas favoritos com shows anunciados
+2. Busca shows em São Paulo via Ticketmaster, 30e e Eventim (Playwright)
+3. Cruza artistas favoritos com shows anunciados (Setlist.fm como fallback)
 4. Analisa os 10 setlists mais recentes de cada artista (frequência estatística)
 5. Cria playlist no Spotify com as músicas mais prováveis
 """
@@ -12,6 +12,7 @@ import os
 import sys
 import time
 import json
+import unicodedata
 import webbrowser
 import urllib.parse
 import http.server
@@ -21,6 +22,8 @@ from datetime import datetime
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -54,7 +57,7 @@ def _make_session(retries=4, backoff_factor=2, status_forcelist=(429, 500, 502, 
         total=retries,
         backoff_factor=backoff_factor,
         status_forcelist=status_forcelist,
-        respect_retry_after_header=False,  # evita sleeps longos impostos pelo header
+        respect_retry_after_header=False,
         allowed_methods=["GET", "POST"],
     )
     adapter = HTTPAdapter(max_retries=retry)
@@ -88,6 +91,16 @@ def _save_uri_cache():
 
 _spotify_token  = None
 _token_capture  = {}
+
+_SCRAPING_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
 
 
 class _OAuthHandler(http.server.BaseHTTPRequestHandler):
@@ -212,10 +225,102 @@ def get_top_artists(limit=TOP_ARTISTS_LIMIT):
     return names
 
 
+# ── Scraping de sites de ingressos ────────────────────────────────────────────
+
+def _normalize(text: str) -> str:
+    nfd = unicodedata.normalize("NFD", text.lower())
+    return "".join(c for c in nfd if unicodedata.category(c) != "Mn")
+
+
+def _artist_in_texts(artist: str, texts: set[str]) -> bool:
+    norm = _normalize(artist)
+    return any(norm in _normalize(t) for t in texts)
+
+
+def _fetch_ticketmaster_sp() -> set[str]:
+    try:
+        r = requests.get(
+            "https://www.ticketmaster.com.br/page/sp",
+            headers=_SCRAPING_HEADERS,
+            timeout=20,
+        )
+        if not r.ok:
+            return set()
+        soup = BeautifulSoup(r.text, "html.parser")
+        texts: set[str] = set()
+        for img in soup.find_all("img", alt=True):
+            if img["alt"].strip():
+                texts.add(img["alt"].strip())
+        for a in soup.find_all("a"):
+            t = a.get_text(separator=" ", strip=True)
+            if t:
+                texts.add(t)
+        return texts
+    except Exception as e:
+        print(f"   Ticketmaster erro: {e}")
+        return set()
+
+
+def _fetch_30e_sp() -> set[str]:
+    try:
+        r = requests.get(
+            "https://www.30e.live/pt-BR/",
+            headers=_SCRAPING_HEADERS,
+            timeout=20,
+        )
+        if not r.ok:
+            return set()
+        soup = BeautifulSoup(r.text, "html.parser")
+        texts: set[str] = set()
+        for img in soup.find_all("img", alt=True):
+            if img["alt"].strip():
+                texts.add(img["alt"].strip())
+        for tag in soup.find_all(["h1", "h2", "h3", "p"]):
+            t = tag.get_text(separator=" ", strip=True)
+            if t:
+                texts.add(t)
+        return texts
+    except Exception as e:
+        print(f"   30e erro: {e}")
+        return set()
+
+
+def _fetch_eventim_sp() -> set[str]:
+    texts: set[str] = set()
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(extra_http_headers=_SCRAPING_HEADERS)
+            page.goto(
+                "https://www.eventim.com.br/eventsearch"
+                "?affiliate=ETB&city=S%C3%A3o+Paulo&genre=Musik",
+                timeout=30_000,
+                wait_until="domcontentloaded",
+            )
+            try:
+                page.wait_for_load_state("networkidle", timeout=15_000)
+            except Exception:
+                pass
+            html = page.content()
+            browser.close()
+
+        soup = BeautifulSoup(html, "html.parser")
+        for img in soup.find_all("img", alt=True):
+            if img["alt"].strip():
+                texts.add(img["alt"].strip())
+        for tag in soup.find_all(["h2", "h3", "h4", "span"]):
+            t = tag.get_text(separator=" ", strip=True)
+            if t:
+                texts.add(t)
+    except Exception as e:
+        print(f"   Eventim erro: {e}")
+    return texts
+
+
 # ── Setlist.fm ────────────────────────────────────────────────────────────────
 
 def search_upcoming_shows_sp(artist_name):
-    """Busca shows dos últimos 12 meses em São Paulo via Setlist.fm."""
+    """Fallback: busca shows dos últimos 12 meses em São Paulo via Setlist.fm."""
     try:
         r = _setlistfm_session.get(
             "https://api.setlist.fm/rest/1.0/search/setlists",
@@ -375,8 +480,24 @@ def run():
 
     top_artists = get_top_artists()
 
-    print(f"\nVerificando shows em São Paulo para {len(top_artists)} artistas...")
-    print("   (isso pode levar alguns minutos)\n")
+    # ── Scraping dos sites de ingressos ──────────────────────────────────────
+    print("\nBuscando shows anunciados em São Paulo...")
+
+    print("   Ticketmaster... ", end="", flush=True)
+    tm_texts = _fetch_ticketmaster_sp()
+    print(f"{len(tm_texts)} elementos")
+
+    print("   30e... ", end="", flush=True)
+    thirty_e_texts = _fetch_30e_sp()
+    print(f"{len(thirty_e_texts)} elementos")
+
+    print("   Eventim (Playwright)... ", end="", flush=True)
+    eventim_texts = _fetch_eventim_sp()
+    print(f"{len(eventim_texts)} elementos")
+
+    # ── Match artistas × shows ────────────────────────────────────────────────
+    print(f"\nCruzando {len(top_artists)} artistas com shows anunciados...")
+    print("   (artistas não encontrados nos sites serão buscados no Setlist.fm)\n")
 
     matches = []
 
@@ -384,11 +505,21 @@ def run():
         sys.stdout.write(f"\r   Verificando {i}/{len(top_artists)}: {artist[:40]:<40}")
         sys.stdout.flush()
 
-        shows = search_upcoming_shows_sp(artist)
-        if shows:
-            matches.append({"artist": artist, "shows": shows})
+        sources_found = []
+        if _artist_in_texts(artist, tm_texts):
+            sources_found.append("Ticketmaster")
+        if _artist_in_texts(artist, thirty_e_texts):
+            sources_found.append("30e")
+        if _artist_in_texts(artist, eventim_texts):
+            sources_found.append("Eventim")
 
-        time.sleep(2.0)
+        if sources_found:
+            matches.append({"artist": artist, "shows": [{"source": sources_found}]})
+        else:
+            shows = search_upcoming_shows_sp(artist)
+            if shows:
+                matches.append({"artist": artist, "shows": shows})
+            time.sleep(2.0)
 
     print(f"\n\n{len(matches)} match(es) encontrado(s)!\n")
 
@@ -403,15 +534,21 @@ def run():
     print("Aguardando 10s antes de iniciar buscas no Spotify...\n")
     time.sleep(10)
 
+    # ── Playlists ─────────────────────────────────────────────────────────────
     for match in matches:
         artist = match["artist"]
         shows  = match["shows"]
 
         print(f"{'─' * 60}")
         print(f"{artist}")
-        print(f"   {len(shows)} show(s) encontrado(s) em São Paulo (últimos 12 meses)")
 
-        mbid = shows[0].get("artist", {}).get("mbid")
+        sources = shows[0].get("source")
+        if sources:
+            print(f"   anunciado em: {', '.join(sources)}")
+            mbid = None
+        else:
+            print(f"   {len(shows)} show(s) registrado(s) no Setlist.fm (últimos 12 meses)")
+            mbid = shows[0].get("artist", {}).get("mbid")
 
         print(f"   Analisando últimos {SETLISTS_TO_ANALYZE} setlists...")
         recent_setlists = get_recent_setlists(artist_mbid=mbid, artist_name=artist)
