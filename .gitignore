@@ -1,0 +1,8 @@
+.env
+.spotify_token_cache
+data/
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+venv/
