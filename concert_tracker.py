@@ -1,7 +1,7 @@
 """
 Concert Tracker
 ---------------
-1. Puxa top 250 artistas do Last.fm
+1. Puxa top 150 artistas do Last.fm
 2. Busca shows em São Paulo via Setlist.fm
 3. Cruza artistas favoritos com shows anunciados
 4. Analisa os 10 setlists mais recentes de cada artista (frequência estatística)
@@ -19,6 +19,8 @@ from collections import Counter
 from datetime import datetime
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -39,15 +41,54 @@ _missing = [v for v in _REQUIRED_VARS if not os.environ.get(v)]
 if _missing:
     sys.exit(f"Variáveis faltando no .env: {', '.join(_missing)}")
 
-TOP_ARTISTS_LIMIT   = 150
-SETLISTS_TO_ANALYZE = 10
-MIN_SONG_APPEARANCES = 2   # mínimo de aparições para entrar na playlist
-MAX_PLAYLISTS       = 10   # limite de playlists por execução (None = sem limite)
+TOP_ARTISTS_LIMIT    = 150
+SETLISTS_TO_ANALYZE  = 10
+MIN_SONG_APPEARANCES = 2
+MAX_PLAYLISTS        = 10   # None = sem limite
 
-# ── Auth Spotify (PKCE-free, Authorization Code) ─────────────────────────────
+# ── Sessions com retry automático ────────────────────────────────────────────
 
-_spotify_token = None
-_token_capture = {}
+def _make_session(retries=4, backoff_factor=2, status_forcelist=(429, 500, 502, 503, 504)):
+    session = requests.Session()
+    retry = Retry(
+        total=retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=status_forcelist,
+        respect_retry_after_header=False,  # evita sleeps longos impostos pelo header
+        allowed_methods=["GET", "POST"],
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+_spotify_session   = _make_session()
+_setlistfm_session = _make_session()
+
+# ── URI cache local ───────────────────────────────────────────────────────────
+
+_URI_CACHE_PATH = ".spotify_uri_cache"
+_uri_cache: dict[str, str | None] = {}
+
+
+def _load_uri_cache():
+    global _uri_cache
+    if os.path.exists(_URI_CACHE_PATH):
+        with open(_URI_CACHE_PATH) as f:
+            _uri_cache = json.load(f)
+
+
+def _save_uri_cache():
+    with open(_URI_CACHE_PATH, "w") as f:
+        json.dump(_uri_cache, f)
+    os.chmod(_URI_CACHE_PATH, 0o600)
+
+
+# ── Auth Spotify (Authorization Code) ────────────────────────────────────────
+
+_spotify_token  = None
+_token_capture  = {}
+
 
 class _OAuthHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -64,7 +105,7 @@ class _OAuthHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(b"<h2>Autenticado! Pode fechar esta aba.</h2>")
 
     def log_message(self, *args):
-        pass  # silencia logs do servidor
+        pass
 
 
 def _get_spotify_token():
@@ -77,8 +118,7 @@ def _get_spotify_token():
         if cached.get("expires_at", 0) > time.time() + 60:
             _spotify_token = cached["access_token"]
             return _spotify_token
-        # tenta refresh
-        r = requests.post("https://accounts.spotify.com/api/token", data={
+        r = _spotify_session.post("https://accounts.spotify.com/api/token", data={
             "grant_type":    "refresh_token",
             "refresh_token": cached["refresh_token"],
             "client_id":     SPOTIFY_CLIENT_ID,
@@ -90,10 +130,10 @@ def _get_spotify_token():
             data["expires_at"] = time.time() + data["expires_in"]
             with open(cache_path, "w") as f:
                 json.dump(data, f)
+            os.chmod(cache_path, 0o600)
             _spotify_token = data["access_token"]
             return _spotify_token
 
-    # Fluxo completo
     scopes = "playlist-modify-public playlist-modify-private user-read-private"
     auth_url = (
         "https://accounts.spotify.com/authorize?"
@@ -104,7 +144,7 @@ def _get_spotify_token():
             "scope":         scopes,
         })
     )
-    print("\n🎵 Abrindo navegador para autenticação do Spotify...")
+    print("\nAbrindo navegador para autenticação do Spotify...")
     webbrowser.open(auth_url)
 
     server = http.server.HTTPServer(("127.0.0.1", 8888), _OAuthHandler)
@@ -113,14 +153,14 @@ def _get_spotify_token():
 
     code = _token_capture.get("code")
     if not code:
-        print("❌ Não foi possível capturar o código de autorização.")
+        print("Não foi possível capturar o código de autorização.")
         sys.exit(1)
 
-    r = requests.post("https://accounts.spotify.com/api/token", data={
-        "grant_type":   "authorization_code",
-        "code":         code,
-        "redirect_uri": SPOTIFY_REDIRECT_URI,
-        "client_id":    SPOTIFY_CLIENT_ID,
+    r = _spotify_session.post("https://accounts.spotify.com/api/token", data={
+        "grant_type":    "authorization_code",
+        "code":          code,
+        "redirect_uri":  SPOTIFY_REDIRECT_URI,
+        "client_id":     SPOTIFY_CLIENT_ID,
         "client_secret": SPOTIFY_CLIENT_SECRET,
     }, timeout=15)
     r.raise_for_status()
@@ -128,6 +168,7 @@ def _get_spotify_token():
     data["expires_at"] = time.time() + data["expires_in"]
     with open(cache_path, "w") as f:
         json.dump(data, f)
+    os.chmod(cache_path, 0o600)
 
     _spotify_token = data["access_token"]
     return _spotify_token
@@ -140,20 +181,20 @@ def _spotify_headers():
 # ── Last.fm ───────────────────────────────────────────────────────────────────
 
 def get_top_artists(limit=TOP_ARTISTS_LIMIT):
-    print(f"\n📡 Buscando top {limit} artistas do Last.fm (@{LASTFM_USERNAME})...")
+    print(f"\nBuscando top {limit} artistas do Last.fm (@{LASTFM_USERNAME})...")
     artists = []
     page = 1
     per_page = 50
 
     while len(artists) < limit:
         r = requests.get("https://ws.audioscrobbler.com/2.0/", params={
-            "method":   "user.gettopartists",
-            "user":     LASTFM_USERNAME,
-            "api_key":  LASTFM_API_KEY,
-            "format":   "json",
-            "limit":    per_page,
-            "page":     page,
-            "period":   "overall",
+            "method":  "user.gettopartists",
+            "user":    LASTFM_USERNAME,
+            "api_key": LASTFM_API_KEY,
+            "format":  "json",
+            "limit":   per_page,
+            "page":    page,
+            "period":  "overall",
         }, timeout=15)
         r.raise_for_status()
         data = r.json()
@@ -167,50 +208,28 @@ def get_top_artists(limit=TOP_ARTISTS_LIMIT):
 
     artists = artists[:limit]
     names = [a["name"] for a in artists]
-    print(f"   ✅ {len(names)} artistas carregados.")
+    print(f"   {len(names)} artistas carregados.")
     return names
 
 
 # ── Setlist.fm ────────────────────────────────────────────────────────────────
 
-def _setlistfm_headers():
-    return {
-        "x-api-key": SETLISTFM_API_KEY,
-        "Accept":    "application/json",
-    }
-
-
 def search_upcoming_shows_sp(artist_name):
-    """Busca shows recentes/próximos em São Paulo via Setlist.fm."""
+    """Busca shows dos últimos 12 meses em São Paulo via Setlist.fm."""
     try:
-        for attempt in range(3):
-            r = requests.get(
-                "https://api.setlist.fm/rest/1.0/search/setlists",
-                headers=_setlistfm_headers(),
-                params={
-                    "artistName": artist_name,
-                    "cityName":   "São Paulo",
-                    "p":          1,
-                },
-                timeout=10,
-            )
-            if r.status_code == 429:
-                time.sleep(5 * (2 ** attempt))  # 5s, 10s, 20s
-                continue
-            break
+        r = _setlistfm_session.get(
+            "https://api.setlist.fm/rest/1.0/search/setlists",
+            headers={"x-api-key": SETLISTFM_API_KEY, "Accept": "application/json"},
+            params={"artistName": artist_name, "cityName": "São Paulo", "p": 1},
+            timeout=10,
+        )
         if r.status_code == 404:
             return []
         r.raise_for_status()
         data = r.json()
         setlists = data.get("setlist", [])
-        # Setlist.fm indexa apenas shows passados — filtra os últimos 12 meses
-        # como proxy para "artistas ativos em SP"
         today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        past_month = today.month - 12
-        window_start = today.replace(
-            year=today.year + (past_month - 1) // 12 if past_month <= 0 else today.year,
-            month=((past_month - 1) % 12) + 1 if past_month <= 0 else past_month,
-        )
+        window_start = today.replace(year=today.year - 1)
         recent = []
         for s in setlists:
             try:
@@ -221,7 +240,7 @@ def search_upcoming_shows_sp(artist_name):
                 pass
         return recent
     except Exception as e:
-        print(f"   ⚠️  Erro ao buscar shows de {artist_name}: {e}")
+        print(f"   Erro ao buscar shows de {artist_name}: {e}")
         return []
 
 
@@ -235,19 +254,19 @@ def get_recent_setlists(artist_mbid=None, artist_name=None, n=SETLISTS_TO_ANALYZ
             url = "https://api.setlist.fm/rest/1.0/search/setlists"
             params["artistName"] = artist_name
 
-        for attempt in range(3):
-            r = requests.get(url, headers=_setlistfm_headers(), params=params, timeout=10)
-            if r.status_code == 429:
-                time.sleep(5 * (2 ** attempt))  # 5s, 10s, 20s
-                continue
-            break
+        r = _setlistfm_session.get(
+            url,
+            headers={"x-api-key": SETLISTFM_API_KEY, "Accept": "application/json"},
+            params=params,
+            timeout=10,
+        )
         if r.status_code == 404:
             return []
         r.raise_for_status()
         data = r.json()
         return data.get("setlist", [])[:n]
     except Exception as e:
-        print(f"   ⚠️  Erro ao buscar setlists de {artist_name}: {e}")
+        print(f"   Erro ao buscar setlists de {artist_name}: {e}")
         return []
 
 
@@ -281,29 +300,35 @@ def analyze_setlists(setlists):
 # ── Spotify ───────────────────────────────────────────────────────────────────
 
 def get_spotify_user_id():
-    r = requests.get("https://api.spotify.com/v1/me", headers=_spotify_headers(), timeout=15)
+    r = _spotify_session.get(
+        "https://api.spotify.com/v1/me",
+        headers=_spotify_headers(),
+        timeout=15,
+    )
     r.raise_for_status()
     return r.json()["id"]
 
 
 def search_track(artist_name, track_name):
-    """Busca uma faixa no Spotify e retorna o URI."""
+    """Busca uma faixa no Spotify e retorna o URI. Usa cache local."""
+    cache_key = f"{artist_name}||{track_name}"
+    if cache_key in _uri_cache:
+        return _uri_cache[cache_key]
+
     query = f"track:{track_name} artist:{artist_name}"
-    for attempt in range(4):
-        r = requests.get(
-            "https://api.spotify.com/v1/search",
-            headers=_spotify_headers(),
-            params={"q": query, "type": "track", "limit": 1},
-            timeout=15,
-        )
-        if r.status_code == 429:
-            wait = min(int(r.headers.get("Retry-After", 2 ** attempt)), 30)
-            time.sleep(wait)
-            continue
-        r.raise_for_status()
-        items = r.json().get("tracks", {}).get("items", [])
-        return items[0]["uri"] if items else None
-    return None
+    r = _spotify_session.get(
+        "https://api.spotify.com/v1/search",
+        headers=_spotify_headers(),
+        params={"q": query, "type": "track", "limit": 1},
+        timeout=15,
+    )
+    r.raise_for_status()
+    items = r.json().get("tracks", {}).get("items", [])
+    uri = items[0]["uri"] if items else None
+
+    _uri_cache[cache_key] = uri
+    _save_uri_cache()
+    return uri
 
 
 def create_playlist(artist_name, track_uris):
@@ -311,24 +336,19 @@ def create_playlist(artist_name, track_uris):
     playlist_name = f"{artist_name} Tour Setlist {datetime.now().year}"
     description = "Predicted setlist based on the latest shows."
 
-    r = requests.post(
+    r = _spotify_session.post(
         "https://api.spotify.com/v1/me/playlists",
         headers={**_spotify_headers(), "Content-Type": "application/json"},
-        json={
-            "name":        playlist_name,
-            "description": description,
-            "public":      True,
-        },
+        json={"name": playlist_name, "description": description, "public": True},
         timeout=15,
     )
     r.raise_for_status()
-    playlist_id = r.json()["id"]
+    playlist_id  = r.json()["id"]
     playlist_url = r.json()["external_urls"]["spotify"]
 
-    # Adiciona em lotes de 100 (limite da API)
     for i in range(0, len(track_uris), 100):
-        batch = track_uris[i:i+100]
-        r = requests.post(
+        batch = track_uris[i:i + 100]
+        r = _spotify_session.post(
             f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks",
             headers={**_spotify_headers(), "Content-Type": "application/json"},
             json={"uris": batch},
@@ -343,19 +363,19 @@ def create_playlist(artist_name, track_uris):
 
 def run():
     print("=" * 60)
-    print("  🎸 Concert Tracker — São Paulo")
+    print("  Concert Tracker — São Paulo")
     print("=" * 60)
 
-    # 1. Autenticação Spotify
-    print("\n🔐 Autenticando no Spotify...")
+    _load_uri_cache()
+
+    print("\nAutenticando no Spotify...")
     _get_spotify_token()
     user_id = get_spotify_user_id()
-    print(f"   ✅ Conectado como {user_id}")
+    print(f"   Conectado como {user_id}")
 
-    # 2. Top artistas Last.fm
     top_artists = get_top_artists()
-    # 3. Busca shows em SP e faz o match
-    print(f"\n🔍 Verificando shows em São Paulo para {len(top_artists)} artistas...")
+
+    print(f"\nVerificando shows em São Paulo para {len(top_artists)} artistas...")
     print("   (isso pode levar alguns minutos)\n")
 
     matches = []
@@ -366,14 +386,11 @@ def run():
 
         shows = search_upcoming_shows_sp(artist)
         if shows:
-            matches.append({
-                "artist": artist,
-                "shows":  shows,
-            })
+            matches.append({"artist": artist, "shows": shows})
 
-        time.sleep(2.0)  # respeita rate limit do setlist.fm
+        time.sleep(2.0)
 
-    print(f"\n\n🎯 {len(matches)} match(es) encontrado(s)!\n")
+    print(f"\n\n{len(matches)} match(es) encontrado(s)!\n")
 
     if MAX_PLAYLISTS is not None:
         matches = matches[:MAX_PLAYLISTS]
@@ -383,39 +400,39 @@ def run():
         print("Nenhum show encontrado para seus artistas favoritos em SP no momento.")
         return
 
-    # 4. Para cada match, analisa setlists e cria playlist
+    print("Aguardando 10s antes de iniciar buscas no Spotify...\n")
+    time.sleep(10)
+
     for match in matches:
         artist = match["artist"]
         shows  = match["shows"]
 
         print(f"{'─' * 60}")
-        print(f"🎤 {artist}")
+        print(f"{artist}")
         print(f"   {len(shows)} show(s) encontrado(s) em São Paulo (últimos 12 meses)")
 
-        # mbid do primeiro show para buscar setlists
         mbid = shows[0].get("artist", {}).get("mbid")
 
-        print(f"   📋 Analisando últimos {SETLISTS_TO_ANALYZE} setlists...")
+        print(f"   Analisando últimos {SETLISTS_TO_ANALYZE} setlists...")
         recent_setlists = get_recent_setlists(artist_mbid=mbid, artist_name=artist)
 
         if not recent_setlists:
-            print("   ⚠️  Sem setlists suficientes, pulando.")
+            print("   Sem setlists suficientes, pulando.")
             continue
 
         ranked_songs = analyze_setlists(recent_setlists)
         filtered = [(s, c, p) for s, c, p in ranked_songs if c >= MIN_SONG_APPEARANCES]
 
         if not filtered:
-            print("   ⚠️  Nenhuma música com aparições suficientes, pulando.")
+            print("   Nenhuma música com aparições suficientes, pulando.")
             continue
 
-        print(f"\n   📊 Top músicas mais prováveis (de {len(recent_setlists)} shows):")
+        print(f"\n   Top músicas mais prováveis (de {len(recent_setlists)} shows):")
         for song, count, pct in filtered[:15]:
             bar = "█" * (pct // 10)
             print(f"      {pct:3d}% {bar:<10} {song}")
 
-        # 5. Busca URIs no Spotify
-        print(f"\n   🔎 Buscando músicas no Spotify...")
+        print(f"\n   Buscando músicas no Spotify...")
         track_uris = []
         not_found  = []
 
@@ -425,24 +442,23 @@ def run():
                 track_uris.append(uri)
             else:
                 not_found.append(song)
-            time.sleep(0.1)
+            time.sleep(0.3)
 
-        print(f"   ✅ {len(track_uris)} faixas encontradas no Spotify")
+        print(f"   {len(track_uris)} faixas encontradas no Spotify")
         if not_found:
-            print(f"   ⚠️  Não encontradas: {', '.join(not_found[:5])}" +
+            print(f"   Não encontradas: {', '.join(not_found[:5])}" +
                   (f" (+{len(not_found)-5})" if len(not_found) > 5 else ""))
 
         if not track_uris:
-            print("   ❌ Nenhuma faixa encontrada, pulando playlist.")
+            print("   Nenhuma faixa encontrada, pulando playlist.")
             continue
 
-        # 6. Cria a playlist
-        print(f"   🎵 Criando playlist no Spotify...")
+        print(f"   Criando playlist no Spotify...")
         playlist_url = create_playlist(artist, track_uris)
-        print(f"   ✅ Playlist criada: {playlist_url}\n")
+        print(f"   Playlist criada: {playlist_url}\n")
 
     print("=" * 60)
-    print("  ✅ Concluído!")
+    print("  Concluído!")
     print("=" * 60)
 
 
