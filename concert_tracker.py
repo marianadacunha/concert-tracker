@@ -240,7 +240,7 @@ def _artist_in_texts(artist: str, texts: set[str]) -> bool:
 def _fetch_ticketmaster_sp() -> set[str]:
     try:
         r = requests.get(
-            "https://www.ticketmaster.com.br/page/sp",
+            "https://www.ticketmaster.com.br/",
             headers=_SCRAPING_HEADERS,
             timeout=20,
         )
@@ -248,13 +248,13 @@ def _fetch_ticketmaster_sp() -> set[str]:
             return set()
         soup = BeautifulSoup(r.text, "html.parser")
         texts: set[str] = set()
+        for tag in soup.find_all(["h3", "h2"]):
+            t = tag.get_text(strip=True)
+            if t:
+                texts.add(t)
         for img in soup.find_all("img", alt=True):
             if img["alt"].strip():
                 texts.add(img["alt"].strip())
-        for a in soup.find_all("a"):
-            t = a.get_text(separator=" ", strip=True)
-            if t:
-                texts.add(t)
         return texts
     except Exception as e:
         print(f"   Ticketmaster erro: {e}")
@@ -264,7 +264,7 @@ def _fetch_ticketmaster_sp() -> set[str]:
 def _fetch_30e_sp() -> set[str]:
     try:
         r = requests.get(
-            "https://www.30e.live/pt-BR/",
+            "https://www.30e.live/pt-BR/tours/",
             headers=_SCRAPING_HEADERS,
             timeout=20,
         )
@@ -272,13 +272,13 @@ def _fetch_30e_sp() -> set[str]:
             return set()
         soup = BeautifulSoup(r.text, "html.parser")
         texts: set[str] = set()
+        for tag in soup.find_all(["h3", "h4"]):
+            t = tag.get_text(strip=True)
+            if t:
+                texts.add(t)
         for img in soup.find_all("img", alt=True):
             if img["alt"].strip():
                 texts.add(img["alt"].strip())
-        for tag in soup.find_all(["h1", "h2", "h3", "p"]):
-            t = tag.get_text(separator=" ", strip=True)
-            if t:
-                texts.add(t)
         return texts
     except Exception as e:
         print(f"   30e erro: {e}")
@@ -292,8 +292,7 @@ def _fetch_eventim_sp() -> set[str]:
             browser = pw.chromium.launch(headless=True)
             page = browser.new_page(extra_http_headers=_SCRAPING_HEADERS)
             page.goto(
-                "https://www.eventim.com.br/eventsearch"
-                "?affiliate=ETB&city=S%C3%A3o+Paulo&genre=Musik",
+                "https://www.eventim.com.br/city/sao-paulo-943/shows-musica-175/",
                 timeout=30_000,
                 wait_until="domcontentloaded",
             )
@@ -308,8 +307,8 @@ def _fetch_eventim_sp() -> set[str]:
         for img in soup.find_all("img", alt=True):
             if img["alt"].strip():
                 texts.add(img["alt"].strip())
-        for tag in soup.find_all(["h2", "h3", "h4", "span"]):
-            t = tag.get_text(separator=" ", strip=True)
+        for tag in soup.find_all(["h2", "h3", "h4"]):
+            t = tag.get_text(strip=True)
             if t:
                 texts.add(t)
     except Exception as e:
