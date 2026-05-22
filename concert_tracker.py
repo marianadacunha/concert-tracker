@@ -291,8 +291,20 @@ def _fetch_eventim_sp() -> set[str]:
     texts: set[str] = set()
     try:
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            page = browser.new_page(extra_http_headers=_SCRAPING_HEADERS)
+            browser = pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-http2",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+            context = browser.new_context(
+                user_agent=_SCRAPING_HEADERS["User-Agent"],
+                viewport={"width": 1280, "height": 800},
+                locale="pt-BR",
+                extra_http_headers={"Accept-Language": "pt-BR,pt;q=0.9"},
+            )
+            page = context.new_page()
             page.goto(
                 "https://www.eventim.com.br/city/sao-paulo-943/shows-musica-175/",
                 timeout=30_000,
