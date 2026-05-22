@@ -11,6 +11,8 @@ Concert Tracker
 import os
 import sys
 import time
+
+sys.stdout.reconfigure(line_buffering=True)
 import json
 import unicodedata
 import webbrowser
@@ -47,7 +49,7 @@ if _missing:
 TOP_ARTISTS_LIMIT    = 150
 SETLISTS_TO_ANALYZE  = 10
 MIN_SONG_APPEARANCES = 2
-MAX_PLAYLISTS        = 10   # None = sem limite
+MAX_PLAYLISTS        = 5    # None = sem limite
 
 # ── Sessions com retry automático ────────────────────────────────────────────
 
@@ -323,9 +325,10 @@ def search_upcoming_shows_sp(artist_name):
     try:
         r = _setlistfm_session.get(
             "https://api.setlist.fm/rest/1.0/search/setlists",
-            headers={"x-api-key": SETLISTFM_API_KEY, "Accept": "application/json"},
+            headers={"x-api-key": SETLISTFM_API_KEY, "Accept": "application/json",
+                     "Connection": "close"},
             params={"artistName": artist_name, "cityName": "São Paulo", "p": 1},
-            timeout=10,
+            timeout=(5, 10),
         )
         if r.status_code == 404:
             return []
@@ -360,9 +363,10 @@ def get_recent_setlists(artist_mbid=None, artist_name=None, n=SETLISTS_TO_ANALYZ
 
         r = _setlistfm_session.get(
             url,
-            headers={"x-api-key": SETLISTFM_API_KEY, "Accept": "application/json"},
+            headers={"x-api-key": SETLISTFM_API_KEY, "Accept": "application/json",
+                     "Connection": "close"},
             params=params,
-            timeout=10,
+            timeout=(5, 10),
         )
         if r.status_code == 404:
             return []
@@ -420,13 +424,16 @@ def search_track(artist_name, track_name):
         return _uri_cache[cache_key]
 
     query = f"track:{track_name} artist:{artist_name}"
-    r = _spotify_session.get(
-        "https://api.spotify.com/v1/search",
-        headers=_spotify_headers(),
-        params={"q": query, "type": "track", "limit": 1},
-        timeout=15,
-    )
-    r.raise_for_status()
+    try:
+        r = _spotify_session.get(
+            "https://api.spotify.com/v1/search",
+            headers=_spotify_headers(),
+            params={"q": query, "type": "track", "limit": 1},
+            timeout=15,
+        )
+        r.raise_for_status()
+    except (requests.exceptions.RetryError, requests.exceptions.HTTPError):
+        return None
     items = r.json().get("tracks", {}).get("items", [])
     uri = items[0]["uri"] if items else None
 
