@@ -606,16 +606,34 @@ def run():
             continue
 
         ranked_songs = analyze_setlists(recent_setlists)
-        filtered = [(s, c, p) for s, c, p in ranked_songs if c >= MIN_SONG_APPEARANCES]
+        ranked_dict  = {s: (c, p) for s, c, p in ranked_songs}
+        qualified    = {s for s, c, p in ranked_songs if c >= MIN_SONG_APPEARANCES}
 
-        if not filtered:
+        if not qualified:
             print("   Nenhuma música com aparições suficientes, pulando.")
             continue
 
-        print(f"\n   Top músicas mais prováveis ({len(recent_setlists)} shows em {datetime.now().year}):")
-        for song, count, pct in filtered[:15]:
+        # Ordena pelas posições do setlist mais recente
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for section in recent_setlists[0].get("sets", {}).get("set", []):
+            for song in section.get("song", []):
+                name = song.get("name", "").strip()
+                if name and name in qualified and name not in seen:
+                    ordered.append(name)
+                    seen.add(name)
+        # Qualificadas ausentes no setlist mais recente → append por frequência
+        for s, c, p in ranked_songs:
+            if c >= MIN_SONG_APPEARANCES and s not in seen:
+                ordered.append(s)
+                seen.add(s)
+
+        filtered = [(s, ranked_dict[s][0], ranked_dict[s][1]) for s in ordered]
+
+        print(f"\n   Setlist previsto ({len(recent_setlists)} shows em {datetime.now().year}):")
+        for i, (song, count, pct) in enumerate(filtered, 1):
             bar = "█" * (pct // 10)
-            print(f"      {pct:3d}% {bar:<10} {song}")
+            print(f"      {i:2d}. {pct:3d}% {bar:<10} {song}")
 
         print(f"\n   Buscando músicas no Spotify...")
         track_uris = []
