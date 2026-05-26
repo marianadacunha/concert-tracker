@@ -25,7 +25,6 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -287,48 +286,6 @@ def _fetch_30e_sp() -> set[str]:
         return set()
 
 
-def _fetch_eventim_sp() -> set[str]:
-    texts: set[str] = set()
-    try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(
-                headless=True,
-                args=[
-                    "--disable-http2",
-                    "--disable-blink-features=AutomationControlled",
-                ],
-            )
-            context = browser.new_context(
-                user_agent=_SCRAPING_HEADERS["User-Agent"],
-                viewport={"width": 1280, "height": 800},
-                locale="pt-BR",
-                extra_http_headers={"Accept-Language": "pt-BR,pt;q=0.9"},
-            )
-            page = context.new_page()
-            page.goto(
-                "https://www.eventim.com.br/city/sao-paulo-943/shows-musica-175/",
-                timeout=30_000,
-                wait_until="domcontentloaded",
-            )
-            try:
-                page.wait_for_load_state("networkidle", timeout=15_000)
-            except Exception:
-                pass
-            html = page.content()
-            browser.close()
-
-        soup = BeautifulSoup(html, "html.parser")
-        for img in soup.find_all("img", alt=True):
-            if img["alt"].strip():
-                texts.add(img["alt"].strip())
-        for tag in soup.find_all(["h2", "h3", "h4"]):
-            t = tag.get_text(strip=True)
-            if t:
-                texts.add(t)
-    except Exception as e:
-        print(f"   Eventim erro: {e}")
-    return texts
-
 
 def _fetch_songkick_sp() -> set[str]:
     try:
@@ -539,10 +496,6 @@ def run():
     thirty_e_texts = _fetch_30e_sp()
     print(f"{len(thirty_e_texts)} elementos")
 
-    print("   Eventim (Playwright)... ", end="", flush=True)
-    eventim_texts = _fetch_eventim_sp()
-    print(f"{len(eventim_texts)} elementos")
-
     print("   Songkick... ", end="", flush=True)
     songkick_texts = _fetch_songkick_sp()
     print(f"{len(songkick_texts)} elementos")
@@ -561,8 +514,6 @@ def run():
             sources_found.append("Ticketmaster")
         if _artist_in_texts(artist, thirty_e_texts):
             sources_found.append("30e")
-        if _artist_in_texts(artist, eventim_texts):
-            sources_found.append("Eventim")
         if _artist_in_texts(artist, songkick_texts):
             sources_found.append("Songkick")
 
