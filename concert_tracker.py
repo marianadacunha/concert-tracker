@@ -575,8 +575,15 @@ def run():
         print("Nenhum show encontrado para seus artistas favoritos em SP no momento.")
         return
 
-    print("Aguardando 10s antes de iniciar buscas no Spotify...\n")
-    time.sleep(10)
+    for i, m in enumerate(matches, 1):
+        print(f"   {i:2d}. {m['artist']:<35} [{', '.join(m['sources'])}]")
+
+    print()
+    resp = input("Criar playlists para todos? [s/N] ").strip().lower()
+    if resp != "s":
+        print("Cancelado.")
+        return
+    print()
 
     # ── Playlists ─────────────────────────────────────────────────────────────
     playlists_created = 0
