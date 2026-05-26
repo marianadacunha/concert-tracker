@@ -49,7 +49,7 @@ if _missing:
 TOP_ARTISTS_LIMIT    = 150
 SETLISTS_TO_ANALYZE  = 10
 MIN_SONG_APPEARANCES = 2
-MAX_PLAYLISTS        = 5    # None = sem limite
+MAX_PLAYLISTS        = None  # None = sem limite
 
 # ── Sessions com retry automático ────────────────────────────────────────────
 
@@ -67,7 +67,7 @@ def _make_session(retries=4, backoff_factor=2, status_forcelist=(429, 500, 502, 
     session.mount("http://", adapter)
     return session
 
-_spotify_session   = _make_session()
+_spotify_session   = _make_session(status_forcelist=(500, 502, 503, 504))  # sem 429
 _setlistfm_session = _make_session()
 
 # ── URI cache local ───────────────────────────────────────────────────────────
@@ -330,61 +330,57 @@ def _fetch_eventim_sp() -> set[str]:
     return texts
 
 
+def _fetch_songkick_sp() -> set[str]:
+    try:
+        r = requests.get(
+            "https://www.songkick.com/metro-areas/31845-brazil-sao-paulo",
+            headers=_SCRAPING_HEADERS,
+            timeout=20,
+        )
+        if not r.ok:
+            return set()
+        soup = BeautifulSoup(r.text, "html.parser")
+        texts: set[str] = set()
+        for tag in soup.find_all(["h2", "h3", "h4", "strong"]):
+            t = tag.get_text(strip=True)
+            if t:
+                texts.add(t)
+        for a in soup.find_all("a", href=lambda h: h and "/artists/" in h):
+            t = a.get_text(strip=True)
+            if t:
+                texts.add(t)
+        return texts
+    except Exception as e:
+        print(f"   Songkick erro: {e}")
+        return set()
+
+
 # ── Setlist.fm ────────────────────────────────────────────────────────────────
 
-def search_upcoming_shows_sp(artist_name):
-    """Fallback: busca shows dos últimos 12 meses em São Paulo via Setlist.fm."""
+def get_recent_setlists(artist_name: str, n=SETLISTS_TO_ANALYZE) -> list:
+    """Pega os N setlists do ano atual de um artista."""
+    current_year = datetime.now().year
     try:
         r = _setlistfm_session.get(
             "https://api.setlist.fm/rest/1.0/search/setlists",
             headers={"x-api-key": SETLISTFM_API_KEY, "Accept": "application/json",
                      "Connection": "close"},
-            params={"artistName": artist_name, "cityName": "São Paulo", "p": 1},
+            params={"artistName": artist_name, "p": 1},
             timeout=(5, 10),
         )
         if r.status_code == 404:
             return []
         r.raise_for_status()
         data = r.json()
-        setlists = data.get("setlist", [])
-        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        window_start = today.replace(year=today.year - 1)
-        recent = []
-        for s in setlists:
+        filtered = []
+        for s in data.get("setlist", []):
             try:
                 date = datetime.strptime(s.get("eventDate", ""), "%d-%m-%Y")
-                if window_start <= date <= today:
-                    recent.append(s)
+                if date.year == current_year:
+                    filtered.append(s)
             except ValueError:
                 pass
-        return recent
-    except Exception as e:
-        print(f"   Erro ao buscar shows de {artist_name}: {e}")
-        return []
-
-
-def get_recent_setlists(artist_mbid=None, artist_name=None, n=SETLISTS_TO_ANALYZE):
-    """Pega os N setlists mais recentes de um artista."""
-    try:
-        params = {"p": 1}
-        if artist_mbid:
-            url = f"https://api.setlist.fm/rest/1.0/artist/{artist_mbid}/setlists"
-        else:
-            url = "https://api.setlist.fm/rest/1.0/search/setlists"
-            params["artistName"] = artist_name
-
-        r = _setlistfm_session.get(
-            url,
-            headers={"x-api-key": SETLISTFM_API_KEY, "Accept": "application/json",
-                     "Connection": "close"},
-            params=params,
-            timeout=(5, 10),
-        )
-        if r.status_code == 404:
-            return []
-        r.raise_for_status()
-        data = r.json()
-        return data.get("setlist", [])[:n]
+        return filtered[:n]
     except Exception as e:
         print(f"   Erro ao buscar setlists de {artist_name}: {e}")
         return []
@@ -435,23 +431,58 @@ def search_track(artist_name, track_name):
     if cache_key in _uri_cache:
         return _uri_cache[cache_key]
 
-    query = f"track:{track_name} artist:{artist_name}"
-    try:
-        r = _spotify_session.get(
-            "https://api.spotify.com/v1/search",
-            headers=_spotify_headers(),
-            params={"q": query, "type": "track", "limit": 1},
-            timeout=15,
-        )
-        r.raise_for_status()
-    except (requests.exceptions.RetryError, requests.exceptions.HTTPError):
-        return None
-    items = r.json().get("tracks", {}).get("items", [])
-    uri = items[0]["uri"] if items else None
+    artist_norm = _normalize(artist_name)
 
-    _uri_cache[cache_key] = uri
+    def _query(q: str, limit: int):
+        try:
+            r = _spotify_session.get(
+                "https://api.spotify.com/v1/search",
+                headers=_spotify_headers(),
+                params={"q": q, "type": "track", "limit": limit},
+                timeout=15,
+            )
+            r.raise_for_status()
+            return r.json().get("tracks", {}).get("items", [])
+        except requests.exceptions.RetryError:
+            return None
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 429:
+                wait = min(int(e.response.headers.get("Retry-After", 30)), 60)
+                print(f"\n   Spotify 429 — aguardando {wait}s...", flush=True)
+                time.sleep(wait)
+            return None
+
+    def _first_matching_artist(items: list) -> str | None:
+        for item in items:
+            for a in item["artists"]:
+                n = _normalize(a["name"])
+                if artist_norm in n or n in artist_norm:
+                    return item["uri"]
+        return None
+
+    # Estratégia 1: query de campo estrita com verificação de artista
+    items = _query(f"track:{track_name} artist:{artist_name}", 3)
+    if items is None:
+        return None
+    uri = _first_matching_artist(items)
+    if uri:
+        _uri_cache[cache_key] = uri
+        _save_uri_cache()
+        return uri
+
+    # Estratégia 2: query solta com verificação de artista
+    items = _query(f"{track_name} {artist_name}", 5)
+    if items is None:
+        return None
+    uri = _first_matching_artist(items)
+    if uri:
+        _uri_cache[cache_key] = uri
+        _save_uri_cache()
+        return uri
+
+    _uri_cache[cache_key] = None
     _save_uri_cache()
-    return uri
+    return None
 
 
 def create_playlist(artist_name, track_uris):
@@ -513,9 +544,12 @@ def run():
     eventim_texts = _fetch_eventim_sp()
     print(f"{len(eventim_texts)} elementos")
 
+    print("   Songkick... ", end="", flush=True)
+    songkick_texts = _fetch_songkick_sp()
+    print(f"{len(songkick_texts)} elementos")
+
     # ── Match artistas × shows ────────────────────────────────────────────────
-    print(f"\nCruzando {len(top_artists)} artistas com shows anunciados...")
-    print("   (artistas não encontrados nos sites serão buscados no Setlist.fm)\n")
+    print(f"\nCruzando {len(top_artists)} artistas com shows anunciados...\n")
 
     matches = []
 
@@ -530,14 +564,11 @@ def run():
             sources_found.append("30e")
         if _artist_in_texts(artist, eventim_texts):
             sources_found.append("Eventim")
+        if _artist_in_texts(artist, songkick_texts):
+            sources_found.append("Songkick")
 
         if sources_found:
-            matches.append({"artist": artist, "shows": [{"source": sources_found}]})
-        else:
-            shows = search_upcoming_shows_sp(artist)
-            if shows:
-                matches.append({"artist": artist, "shows": shows})
-            time.sleep(2.0)
+            matches.append({"artist": artist, "sources": sources_found})
 
     print(f"\n\n{len(matches)} match(es) encontrado(s)!\n")
 
@@ -554,25 +585,18 @@ def run():
 
     # ── Playlists ─────────────────────────────────────────────────────────────
     for match in matches:
-        artist = match["artist"]
-        shows  = match["shows"]
+        artist  = match["artist"]
+        sources = match["sources"]
 
         print(f"{'─' * 60}")
         print(f"{artist}")
+        print(f"   anunciado em: {', '.join(sources)}")
 
-        sources = shows[0].get("source")
-        if sources:
-            print(f"   anunciado em: {', '.join(sources)}")
-            mbid = None
-        else:
-            print(f"   {len(shows)} show(s) registrado(s) no Setlist.fm (últimos 12 meses)")
-            mbid = shows[0].get("artist", {}).get("mbid")
-
-        print(f"   Analisando últimos {SETLISTS_TO_ANALYZE} setlists...")
-        recent_setlists = get_recent_setlists(artist_mbid=mbid, artist_name=artist)
+        print(f"   Analisando setlists de {datetime.now().year}...")
+        recent_setlists = get_recent_setlists(artist_name=artist)
 
         if not recent_setlists:
-            print("   Sem setlists suficientes, pulando.")
+            print(f"   Sem setlists de {datetime.now().year}, pulando.")
             continue
 
         ranked_songs = analyze_setlists(recent_setlists)
@@ -582,7 +606,7 @@ def run():
             print("   Nenhuma música com aparições suficientes, pulando.")
             continue
 
-        print(f"\n   Top músicas mais prováveis (de {len(recent_setlists)} shows):")
+        print(f"\n   Top músicas mais prováveis ({len(recent_setlists)} shows em {datetime.now().year}):")
         for song, count, pct in filtered[:15]:
             bar = "█" * (pct // 10)
             print(f"      {pct:3d}% {bar:<10} {song}")
