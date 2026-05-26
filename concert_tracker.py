@@ -502,9 +502,9 @@ def create_playlist(artist_name, track_uris):
 
     for i in range(0, len(track_uris), 100):
         batch = track_uris[i:i + 100]
-        r = _spotify_session.post(
-            f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks",
-            headers={**_spotify_headers(), "Content-Type": "application/json"},
+        r = requests.post(
+            f"https://api.spotify.com/v1/playlists/{playlist_id}/items",
+            headers=_spotify_headers(),
             json={"uris": batch},
             timeout=15,
         )
@@ -572,10 +572,6 @@ def run():
 
     print(f"\n\n{len(matches)} match(es) encontrado(s)!\n")
 
-    if MAX_PLAYLISTS is not None:
-        matches = matches[:MAX_PLAYLISTS]
-        print(f"   (limitado a {MAX_PLAYLISTS} playlists para este teste)\n")
-
     if not matches:
         print("Nenhum show encontrado para seus artistas favoritos em SP no momento.")
         return
@@ -584,7 +580,11 @@ def run():
     time.sleep(10)
 
     # ── Playlists ─────────────────────────────────────────────────────────────
+    playlists_created = 0
     for match in matches:
+        if MAX_PLAYLISTS is not None and playlists_created >= MAX_PLAYLISTS:
+            break
+
         artist  = match["artist"]
         sources = match["sources"]
 
@@ -635,6 +635,7 @@ def run():
         print(f"   Criando playlist no Spotify...")
         playlist_url = create_playlist(artist, track_uris)
         print(f"   Playlist criada: {playlist_url}\n")
+        playlists_created += 1
 
     print("=" * 60)
     print("  Concluído!")
