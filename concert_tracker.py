@@ -341,14 +341,13 @@ def _fetch_songkick_sp() -> set[str]:
             return set()
         soup = BeautifulSoup(r.text, "html.parser")
         texts: set[str] = set()
-        for tag in soup.find_all(["h2", "h3", "h4", "strong"]):
-            t = tag.get_text(strip=True)
-            if t:
-                texts.add(t)
-        for a in soup.find_all("a", href=lambda h: h and "/artists/" in h):
-            t = a.get_text(strip=True)
-            if t:
-                texts.add(t)
+        # Coleta apenas <li> que contêm links de shows ou festivais reais.
+        # Links /artists/ são sidebar ("artistas populares") e geram falsos positivos.
+        for li in soup.find_all("li"):
+            if li.find("a", href=lambda h: h and ("/concerts/" in h or "/festivals/" in h)):
+                t = li.get_text(separator=" ", strip=True)
+                if t:
+                    texts.add(t)
         return texts
     except Exception as e:
         print(f"   Songkick erro: {e}")
